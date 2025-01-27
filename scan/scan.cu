@@ -27,6 +27,58 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void
+up_sweep(int* result, int N, int d) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i < N / (d << 1)) {
+        int k = i * (d << 1);
+        assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
+        assert(k + d - 1 >= 0 && k + d - 1 < N);
+        result[k + (d << 1) - 1] += result[k + d - 1];
+    }
+}
+
+
+__global__ void
+down_sweep(int* result, int N, int d) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i < N / (d << 1)) {
+        int k = i * (d << 1);
+        assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
+        assert(k + d - 1 >= 0 && k + d - 1 < N);
+        int temp = result[k + d - 1];
+        result[k + d - 1] = result[k + (d << 1) - 1];
+        result[k + (d << 1) - 1] += temp;
+    }
+}
+
+
+
+
+__global__ void
+fill_flag(int * device_input, int * flag, int N) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    
+    if (i < N - 1 && device_input[i] == device_input[i + 1]) {
+        flag[i] = 1;
+    }
+}
+
+
+
+__global__ void
+fill_output(int * flag, int * pre_sum, int * device_output, int N) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i < N && flag[i] == 1) {
+        device_output[pre_sum[i]] = i;
+    }
+}
+
+
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -53,8 +105,23 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int rounded_length = nextPow2(N);
+
+    const int threadsPerBlock = 512;
+    int blocks = (rounded_length + threadsPerBlock - 1) / threadsPerBlock;
 
 
+    for (int d = 1; (d << 1) < rounded_length; d <<= 1) {
+        blocks = ((rounded_length) / (d << 1) + threadsPerBlock - 1) / threadsPerBlock;
+        up_sweep<<<blocks, threadsPerBlock>>> (result, rounded_length, d);
+    }
+    int zero = 0;
+    cudaMemcpy(&result[rounded_length - 1], &zero, sizeof(int), cudaMemcpyHostToDevice);
+
+    for (int d = rounded_length / 2; d > 0; d >>= 1) {
+        blocks = ((rounded_length) / (d << 1) + threadsPerBlock - 1) / threadsPerBlock;
+        down_sweep<<<blocks, threadsPerBlock>>>(result, rounded_length, d);
+    }
 }
 
 
@@ -160,8 +227,40 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int rounded_length = nextPow2(length);
 
-    return 0; 
+
+    int * flag = nullptr;
+    int * pre_sum = nullptr; 
+
+    int * f = new int[length];
+    
+    cudaMalloc(&flag, rounded_length * sizeof(int));
+    cudaMalloc(&pre_sum, rounded_length * sizeof(int));
+    cudaMemset(flag, 0, rounded_length * sizeof(int));
+
+    // fill flag，如果是repeat 设为1
+    const int threadsPerBlock = 512;
+    int blocks = (rounded_length + threadsPerBlock - 1) / threadsPerBlock;
+
+    fill_flag<<<blocks, threadsPerBlock>>> (device_input, flag, rounded_length);
+
+    cudaMemcpy(f, flag, length * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // 前缀和
+    cudaMemcpy(pre_sum, flag, rounded_length * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(flag, length, pre_sum);
+
+    // fill device_output if flag[idx] = 1, output[sum[idx] ] = idx
+    fill_output<<<blocks, threadsPerBlock>>> (flag, pre_sum, device_output, rounded_length);
+
+    // pre_sum 最后的一个元素肯定是flag之和，flag最后一个元素肯定是0，因为他没有后继元素 
+    int res;
+    cudaMemcpy(&res, pre_sum + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(flag);
+    cudaFree(pre_sum);
+    return res; 
 }
 
 
