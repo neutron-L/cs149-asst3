@@ -14,6 +14,9 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define BLOCKDIM 32
+#define BLOCKSIZE (BLOCKDIM * BLOCKDIM)
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -427,6 +430,129 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+/* 自定义的render */
+
+
+__global__ int InsideCircle(const int index, const int screenMinX, const int screenMinY, 
+        const int screenMaxX, const int screenMaxY) {
+    int index3 = 3 * index;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float  rad = cuConstRendererParams.radius[index];
+
+    int closestX = max(screenMinX, min(p.x, screenMaxX));
+    int closestY = max(screenMinY, min(p.y, screenMaxY));
+    int dist = sqrt((closestX - p.x) * (closestX - p.x) + (closestY - p.y) * (closestY - p.y));
+
+    return dist > rad ? 0 : 1;
+}
+
+
+__global__ void kernelRenderCirclesPerPixel() {
+    int index = threadIdx.x * blockDim.y + threadIdx.y;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x; 
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y; 
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight)
+        return;
+
+     // a bunch of clamps.  Is there a CUDA built-in for this?
+     short screenMinX = blockIdx.x * blockDim.x;
+     short screenMinY = blockIdx.y * blockDim.y;
+     short screenMaxX = __min(screenMinX + blockDim.x - 1, imageWidth - 1);
+     short screenMaxY = __min(screenMinY + blockDim.y - 1, imageHeight - 1); 
+
+    
+    // 计算哪些圆可能和区域内
+    // flag长度是BLOCKSIZE，一个线程块中线程数量，但是circle的数量可能大于这个值
+    // 不过本身只是判断圆是否和区域相交，对于每个线程处理的像素都未必在圆内
+    // 因此下列数组中的每个位置其实表示的是idx idx + BLOCKSIZE ... 是否有哪个圆和区域有相交
+    // 增加了判断次数但是节省了空间
+    __shared__ uint flag[BLOCKSIZE];
+    __shared__ uint presum[BLOCKSIZE];
+    __shared__ uint circles[BLOCKSIZE];
+
+    for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCKSIZE) {
+        int cidx = index + i;
+        if (index >= cuConstRendererParams.numCircles) {
+            break;
+        } else if (!flag[i % BLOCKSIZE]){
+            flag[cidx % BLOCKSIZE] = InsideCircle(index, screenMinX, screenMinY, screenMaxX, screenMaxY);
+        }
+    }
+    __syncthreads();
+
+    if (index == 0) {
+        cudaMemcpy(pre_sum, flag, BLOCKSIZE * sizeof(int), cudaMemcpyDeviceToDevice);
+    }
+    __syncthreads();
+
+    // 通过计算前缀和，求出哪些下标的圆可能与当前区域相交
+    for (int d = 1; (d << 1) < BLOCKSIZE; d <<= 1) {
+        if (index < N / (d << 1)) {
+            int k = index * (d << 1);
+            assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
+            assert(k + d - 1 >= 0 && k + d - 1 < N);
+            pre_sum[k + (d << 1) - 1] += pre_sum[k + d - 1];
+        }
+        __syncthreads();
+    }
+    if (index == 0) {
+        int zero = 0;
+        cudaMemcpy(&pre_sum[N - 1], &zero, sizeof(int), cudaMemcpyHostToDevice);
+    }
+    __syncthreads();
+
+    for (int d = BLOCKSIZE / 2; d > 0; d >>= 1) {
+        if (index < BLOCKSIZE / (d << 1)) {
+            int k = index * (d << 1);
+            assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
+            assert(k + d - 1 >= 0 && k + d - 1 < N);
+            int temp = pre_sum[k + d - 1];
+            pre_sum[k + d - 1] = pre_sum[k + (d << 1) - 1];
+            pre_sum[k + (d << 1) - 1] += temp;
+        }
+        __syncthreads();
+    }
+
+    // 通过前缀和，求出可能和当前区域相交的圆的下标
+    if (index < BLOCKSIZE && flag[index] == 1) {
+        circles[pre_sum[index]] = index;
+    }
+    __syncthreads();
+
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    int num = pre_sum[BLOCKSIZE - 1] + flag[BLOCKSIZE - 1];
+
+    bool flag = false;
+    for (int base = 0; base < cuConstRendererParams.numCircles && !flag; base += BLOCKSIZE) {
+        for (int i = 0; i < num; ++i) {
+            int cidx = base + circles[i];
+            if (cidx >= cuConstRendererParams.numCircles){
+                flag = true;
+                break;
+            }
+            
+            // 像素可能不在圆内
+            if (!InsideCircle(cidx, pixelX, pixelY, pixelX, pixelY)) {
+                continue;
+            }
+            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+            shadePixel(index, pixelCenterNorm, p, imgPtr);
+        }
+    }
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -637,9 +763,17 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    dim3 blockDim(BLOCKDIM, BLOCKDIM);
+
+    dim gridDim((imageWidth + blockDim.x - 1) / blockDim.x, (imageHeight + blockDim.y - 1) / blockDim.y);
+    kernelRenderCirclesPerPixel<<<gridDim, blockDim>>>();
+    
     cudaDeviceSynchronize();
 }
