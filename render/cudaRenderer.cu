@@ -469,9 +469,7 @@ __global__ void kernelRenderCirclesPerPixel() {
     
     // 计算哪些圆可能和区域内
     // flag长度是BLOCKSIZE，一个线程块中线程数量，但是circle的数量可能大于这个值
-    // 不过本身只是判断圆是否和区域相交，对于每个线程处理的像素都未必在圆内
-    // 因此下列数组中的每个位置其实表示的是idx idx + BLOCKSIZE ... 是否有哪个圆和区域有相交
-    // 增加了判断次数但是节省了空间
+    // 因此线程块中的线程per-BLOCKSIZE个circle判断
     __shared__ uint flag[BLOCKSIZE];
     __shared__ uint presum[BLOCKSIZE];
     __shared__ uint circles[BLOCKSIZE];
@@ -479,77 +477,79 @@ __global__ void kernelRenderCirclesPerPixel() {
     for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCKSIZE) {
         int cidx = index + i;
         if (index >= cuConstRendererParams.numCircles) {
-            break;
-        } else if (!flag[i % BLOCKSIZE]){
+            flag[cidx % BLOCKSIZE] = 0;
+        } else {
             flag[cidx % BLOCKSIZE] = InsideCircle(index, screenMinX, screenMinY, screenMaxX, screenMaxY);
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    if (index == 0) {
-        cudaMemcpy(pre_sum, flag, BLOCKSIZE * sizeof(int), cudaMemcpyDeviceToDevice);
-    }
-    __syncthreads();
+        if (index == 0) {
+            cudaMemcpy(pre_sum, flag, BLOCKSIZE * sizeof(int), cudaMemcpyDeviceToDevice);
+        }
+        __syncthreads();
 
-    // 通过计算前缀和，求出哪些下标的圆可能与当前区域相交
-    for (int d = 1; (d << 1) < BLOCKSIZE; d <<= 1) {
-        if (index < N / (d << 1)) {
-            int k = index * (d << 1);
-            assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
-            assert(k + d - 1 >= 0 && k + d - 1 < N);
-            pre_sum[k + (d << 1) - 1] += pre_sum[k + d - 1];
+        // 通过计算前缀和，求出哪些下标的圆可能与当前区域相交
+        for (int d = 1; (d << 1) < BLOCKSIZE; d <<= 1) {
+            if (index < N / (d << 1)) {
+                int k = index * (d << 1);
+                assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
+                assert(k + d - 1 >= 0 && k + d - 1 < N);
+                pre_sum[k + (d << 1) - 1] += pre_sum[k + d - 1];
+            }
+            __syncthreads();
+        }
+        if (index == 0) {
+            int zero = 0;
+            cudaMemcpy(&pre_sum[N - 1], &zero, sizeof(int), cudaMemcpyHostToDevice);
+        }
+        __syncthreads();
+
+        for (int d = BLOCKSIZE / 2; d > 0; d >>= 1) {
+            if (index < BLOCKSIZE / (d << 1)) {
+                int k = index * (d << 1);
+                assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
+                assert(k + d - 1 >= 0 && k + d - 1 < N);
+                int temp = pre_sum[k + d - 1];
+                pre_sum[k + d - 1] = pre_sum[k + (d << 1) - 1];
+                pre_sum[k + (d << 1) - 1] += temp;
+            }
+            __syncthreads();
+        }
+
+        // 通过前缀和，求出可能和当前区域相交的圆的下标
+        if (index < BLOCKSIZE && flag[index] == 1) {
+            circles[pre_sum[index]] = index;
+        }
+        __syncthreads();
+
+
+        float invWidth = 1.f / imageWidth;
+        float invHeight = 1.f / imageHeight;
+
+        int num = pre_sum[BLOCKSIZE - 1] + flag[BLOCKSIZE - 1];
+
+        bool flag = false;
+        for (int base = 0; base < cuConstRendererParams.numCircles && !flag; base += BLOCKSIZE) {
+            for (int i = 0; i < num; ++i) {
+                int cidx = base + circles[i];
+                if (cidx >= cuConstRendererParams.numCircles){
+                    flag = true;
+                    break;
+                }
+                
+                // 像素可能不在圆内
+                if (!InsideCircle(cidx, pixelX, pixelY, pixelX, pixelY)) {
+                    continue;
+                }
+                float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+                float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                            invHeight * (static_cast<float>(pixelY) + 0.5f));
+                shadePixel(index, pixelCenterNorm, p, imgPtr);
+            }
         }
         __syncthreads();
     }
-    if (index == 0) {
-        int zero = 0;
-        cudaMemcpy(&pre_sum[N - 1], &zero, sizeof(int), cudaMemcpyHostToDevice);
-    }
-    __syncthreads();
 
-    for (int d = BLOCKSIZE / 2; d > 0; d >>= 1) {
-        if (index < BLOCKSIZE / (d << 1)) {
-            int k = index * (d << 1);
-            assert(k + (d << 1) - 1 >= 0 && k + 2 * d - 1 < N);
-            assert(k + d - 1 >= 0 && k + d - 1 < N);
-            int temp = pre_sum[k + d - 1];
-            pre_sum[k + d - 1] = pre_sum[k + (d << 1) - 1];
-            pre_sum[k + (d << 1) - 1] += temp;
-        }
-        __syncthreads();
-    }
-
-    // 通过前缀和，求出可能和当前区域相交的圆的下标
-    if (index < BLOCKSIZE && flag[index] == 1) {
-        circles[pre_sum[index]] = index;
-    }
-    __syncthreads();
-
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    int num = pre_sum[BLOCKSIZE - 1] + flag[BLOCKSIZE - 1];
-
-    bool flag = false;
-    for (int base = 0; base < cuConstRendererParams.numCircles && !flag; base += BLOCKSIZE) {
-        for (int i = 0; i < num; ++i) {
-            int cidx = base + circles[i];
-            if (cidx >= cuConstRendererParams.numCircles){
-                flag = true;
-                break;
-            }
-            
-            // 像素可能不在圆内
-            if (!InsideCircle(cidx, pixelX, pixelY, pixelX, pixelY)) {
-                continue;
-            }
-            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-        }
-    }
 }
 
 
